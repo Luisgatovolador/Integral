@@ -12,6 +12,57 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import io
 import os
+from fpdf import FPDF
+import io
+import base64
+
+def df_to_html_table(df):
+    """Convierte un DataFrame a tabla HTML para incrustar en PDF si quieres."""
+    return df.to_html()
+
+def create_pdf(stats_df, resultados_df, imagenes_dict):
+    """
+    Crea un PDF con estadística y resultados y gráficos.
+    imagenes_dict = {'nombre_imagen': bytes_imagen_png, ...}
+    """
+    pdf = FPDF()
+    pdf.set_auto_page_break(auto=True, margin=15)
+    pdf.add_page()
+    pdf.set_font("Arial", 'B', 16)
+    pdf.cell(0, 10, "Evaluación Psicológica Integral - Reporte", ln=True, align='C')
+    pdf.ln(10)
+
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 10, "Estadísticas descriptivas:", ln=True)
+    pdf.set_font("Arial", '', 10)
+
+    # Convertir stats_df a texto plano y agregar línea a línea
+    stats_text = stats_df.round(3).to_string()
+    for line in stats_text.split('\n'):
+        pdf.cell(0, 6, line, ln=True)
+
+    pdf.ln(10)
+    pdf.set_font("Arial", 'B', 12)
+    pdf.cell(0, 10, "Resultados:", ln=True)
+    pdf.set_font("Arial", '', 8)
+
+    # Por simplicidad vamos a poner sólo las primeras filas en texto (puedes mejorarlo con tabla con fpdf más compleja)
+    resultados_preview = resultados_df.head(10).to_string()
+    for line in resultados_preview.split('\n'):
+        pdf.cell(0, 6, line, ln=True)
+    pdf.ln(10)
+
+    # Agregar imágenes (gráficas)
+    for nombre, img_bytes in imagenes_dict.items():
+        pdf.set_font("Arial", 'B', 12)
+        pdf.cell(0, 10, nombre, ln=True)
+        pdf.image(io.BytesIO(img_bytes), w=180)
+        pdf.ln(10)
+
+    # Guardar a bytes
+    pdf_bytes = pdf.output(dest='S').encode('latin1')
+    return pdf_bytes
+
 
 plt.style.use('ggplot')
 
@@ -271,6 +322,11 @@ def main():
             st.subheader("Datos cargados")
             st.dataframe(df)
 
+            # ===== Agregado: Estadísticas descriptivas =====
+            st.subheader("Estadísticas descriptivas del dataset")
+            stats_df = df.describe()
+            st.dataframe(stats_df)
+
             temas = ["Personalidad", "Carácter", "Ambos"]
             seleccion = st.radio("Selecciona el tema para el entrenamiento:", temas)
 
@@ -279,71 +335,146 @@ def main():
             else:
                 temas_elegidos = [seleccion]
 
+            subcats_posibles = []
+            for tema in temas_elegidos:
+                for sub in subcategorias[tema]:
+                    subcats_posibles.append(f"{tema} > {sub}")
+
+            subcats_elegidas = st.multiselect(
+                "Opcional: elige las subcategorías específicas (si no eliges, se usarán todas del tema):",
+                subcats_posibles,
+                default=subcats_posibles
+            )
+
             nombre_modelo = st.text_input(
                 "Nombre del modelo",
                 f"modelo_{'_'.join([t.lower() for t in temas_elegidos])}"
             )
 
             if st.button("Entrenar"):
-                resultado = procesar(df, temas_elegidos, entrenar=True)
-                if resultado:
-                    df_resultados, modelo, descripciones, X_scaled, silhouette, davies = resultado
+                if subcats_elegidas and len(subcats_elegidas) < 2:
+                    st.error("Por favor, selecciona al menos dos subcategorías o deja vacío para usar todas.")
+                    return
 
-                    # 🔷 Asegurar columnas únicas
-                    df_resultados = hacer_columnas_unicas(df_resultados)
+                temas_elegidos_dict = {}
+                if subcats_elegidas and len(subcats_elegidas) < len(subcats_posibles):
+                    for item in subcats_elegidas:
+                        tema, subcat = item.split(" > ")
+                        if tema not in temas_elegidos_dict:
+                            temas_elegidos_dict[tema] = []
+                        temas_elegidos_dict[tema].append(subcat)
+                else:
+                    for tema in temas_elegidos:
+                        temas_elegidos_dict[tema] = list(subcategorias[tema].keys())
 
-                    modelo_path = os.path.join(modelos_dir, f"{nombre_modelo}.pkl")
-                    with open(modelo_path, "wb") as f:
-                        pickle.dump((modelo, df_resultados.columns.tolist()), f)
-                    st.success(f"Modelo guardado en: {modelo_path}")
+                df.columns = df.columns.str.strip()
+                df_subs = pd.DataFrame()
 
-                    st.subheader("Resultados obtenidos")
-                    st.dataframe(df_resultados)
+                for tema, subs in temas_elegidos_dict.items():
+                    for sub in subs:
+                        preguntas = subcategorias[tema][sub]
+                        preguntas_existentes = [p for p in preguntas if p in df.columns]
+                        if preguntas_existentes:
+                            df_subs[sub] = df[preguntas_existentes].mean(axis=1)
 
-                    # ---- NUEVAS GRÁFICAS AÑADIDAS ----
-                    if 'Cluster' in df.columns:
-                        y_true = df['Cluster'].values
-                        y_pred = df_resultados['Cluster'].values
+                if df_subs.empty:
+                    st.error("No hay suficientes datos para calcular subcategorías.")
+                    return
 
-                        st.subheader("Comparación visual entre clusters verdaderos y predichos")
-                        png_comp = grafica_comparacion_clusters(X_scaled, y_true, y_pred, modelo.cluster_centers_)
-                        st.image(png_comp)
-                        st.download_button(
-                            label="Descargar gráfica de comparación",
-                            data=png_comp,
-                            file_name="comparacion_clusters.png",
-                            mime="image/png"
-                        )
+                X_scaled = scale(df_subs)
+                k_fijo = len(df_subs.columns)
+                modelo = KMeans(n_clusters=k_fijo, random_state=123, n_init=25)
+                modelo.fit(X_scaled)
+                y_pred = modelo.predict(X_scaled)
 
-                        st.subheader("Matriz de confusión")
-                        png_confusion = grafica_confusion_matrix(y_true, y_pred)
-                        st.image(png_confusion)
-                        st.download_button(
-                            label="Descargar matriz de confusión",
-                            data=png_confusion,
-                            file_name="matriz_confusion.png",
-                            mime="image/png"
-                        )
+                df_subs_renombrado = df_subs.rename(columns=lambda x: f"{x} (modelo)")
 
-                    elif 'Descripción' in df.columns:
-                        true_labels = pd.factorize(df['Descripción'])[0]
-                        pred_labels = df_resultados['Cluster'].values
-                        st.subheader("Comparación entre descripciones verdaderas y clusters predichos")
-                        png_comp = grafica_comparacion(true_labels, pred_labels)
-                        st.download_button(
-                            label="Descargar gráfica de comparación",
-                            data=png_comp,
-                            file_name="comparacion_descripciones.png",
-                            mime="image/png"
-                        )
+                df_resultados = pd.concat([df, df_subs_renombrado], axis=1)
+                df_resultados["Cluster (modelo)"] = y_pred
 
-                    # Gráficas ya existentes
+                centroides = modelo.cluster_centers_
+                cluster_descripciones = {}
+                asignadas = set()
+                for i, centroide in enumerate(centroides):
+                    indices_ordenados = np.argsort(centroide)[::-1]
+                    nombre_sub = None
+                    for idx_sub in indices_ordenados:
+                        subcat = df_subs.columns[idx_sub]
+                        if subcat not in asignadas:
+                            nombre_sub = subcat
+                            asignadas.add(subcat)
+                            break
+                    if nombre_sub is None:
+                        nombre_sub = df_subs.columns[indices_ordenados[0]]
+                    cluster_descripciones[i] = f"{nombre_sub}"
+
+                df_resultados["Descripción (modelo)"] = df_resultados["Cluster (modelo)"].map(cluster_descripciones)
+
+                silhouette = silhouette_score(X_scaled, y_pred)
+                davies = davies_bouldin_score(X_scaled, y_pred)
+
+                modelo_path = os.path.join(modelos_dir, f"{nombre_modelo}.pkl")
+                with open(modelo_path, "wb") as f:
+                    pickle.dump((modelo, df_subs.columns.tolist()), f)
+                st.success(f"Modelo guardado en: {modelo_path}")
+
+                st.subheader("Resultados")
+                st.dataframe(df_resultados)
+
+                csv_data = df_resultados.to_csv(index=False).encode('utf-8')
+                st.download_button(
+                    label="Descargar resultados (.csv)",
+                    data=csv_data,
+                    file_name=f"{nombre_modelo}_resultados.csv",
+                    mime="text/csv"
+                )
+
+                png_metrics = grafica_metricas(silhouette, davies)
+                st.download_button("Descargar métricas del modelo", png_metrics, "metricas.png", "image/png")
+
+                # ---- Nuevas gráficas ----
+                if 'Cluster' in df.columns:
+                    y_true = df['Cluster'].values
+                    y_pred = df_resultados['Cluster'].values
+
+                    st.subheader("Comparación visual entre clusters verdaderos y predichos")
+                    png_comp = grafica_comparacion_clusters(X_scaled, y_true, y_pred, modelo.cluster_centers_)
+                    st.image(png_comp)
+                    st.download_button(
+                        label="Descargar gráfica de comparación",
+                        data=png_comp,
+                        file_name="comparacion_clusters.png",
+                        mime="image/png"
+                    )
+
+                    st.subheader("Matriz de confusión")
+                    png_confusion = grafica_confusion_matrix(y_true, y_pred)
+                    st.image(png_confusion)
+                    st.download_button(
+                        label="Descargar matriz de confusión",
+                        data=png_confusion,
+                        file_name="matriz_confusion.png",
+                        mime="image/png"
+                    )
+
+                elif 'Descripción' in df.columns:
+                    true_labels = pd.factorize(df['Descripción'])[0]
+                    pred_labels = df_resultados['Cluster'].values
+                    st.subheader("Comparación entre descripciones verdaderas y clusters predichos")
+                    png_comp = grafica_comparacion(true_labels, pred_labels)
+                    st.download_button(
+                        label="Descargar gráfica de comparación",
+                        data=png_comp,
+                        file_name="comparacion_descripciones.png",
+                        mime="image/png"
+                    )
+
                     png_clusters = grafica_clusters(
                         X_scaled,
                         df_resultados["Cluster"].values,
                         modelo,
-                        df_resultados[df_resultados.columns[-len(descripciones):]],
-                        descripciones,
+                        df_resultados[df_resultados.columns[-len(cluster_descripciones):]],
+                        cluster_descripciones,
                         temas_elegidos
                     )
                     st.download_button("Descargar gráfica de clusters", png_clusters, "clusters.png", "image/png")
@@ -410,7 +541,6 @@ def main():
             if resultado:
                 df_resultados, _, descripciones, X_scaled, silhouette, davies = resultado
 
-                # 🔷 Asegurar columnas únicas
                 df_resultados = hacer_columnas_unicas(df_resultados)
 
                 st.subheader("Resultados")
@@ -467,11 +597,9 @@ def main():
                     mime="text/csv"
                 )
 
-                # ---- NUEVAS GRÁFICAS AÑADIDAS ----
                 if "Cluster" in df_resultados.columns:
                     y_pred = df_resultados["Cluster"].values
 
-                    # Si en el archivo original hay columna 'Cluster' para comparar
                     if "Cluster" in df.columns:
                         y_true = df["Cluster"].values
 
@@ -495,7 +623,6 @@ def main():
                             mime="image/png"
                         )
 
-                # Gráficas ya existentes
                 png_clusters = grafica_clusters(
                     X_scaled,
                     df_resultados["Cluster"].values,
@@ -511,7 +638,6 @@ def main():
 
                 png_metrics = grafica_metricas(silhouette, davies)
                 st.download_button("Descargar métricas del modelo", png_metrics, "metricas.png", "image/png")
-
 
 if __name__ == "__main__":
     main()
